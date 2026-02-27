@@ -1174,6 +1174,11 @@ getgenv().SimpleSpy = {
 -------------------------------------------------------------------------------
 
 local MCPBridgeURL = getgenv().RemoteLoggerBridgeURL or "localhost:16385"
+local MCPBridgeSecret = (function()
+    local g = getgenv and getgenv()
+    if g and g.RemoteLoggerBridgeSecret and type(g.RemoteLoggerBridgeSecret) == "string" then return g.RemoteLoggerBridgeSecret end
+    return nil
+end)()
 local MCPEnabled = getgenv().RemoteLoggerMCPEnabled ~= false -- Default true
 local MCPWebSocket = nil
 local MCPConnection = nil
@@ -1266,13 +1271,10 @@ local function handleMCPCommand(data)
         limit = math.min(math.max(limit, 1), 500)
 
         local output = {}
-        local count = 0
-
-        for i = #logs, 1, -1 do
-            if count >= limit then break end
-            local serialized = serializeLogForMCP(logs[i], #logs - i + 1)
+        -- Index 1 = oldest (logs[1]), index N = newest (logs[N]); iterate oldest-first
+        for i = 1, math.min(limit, #logs) do
+            local serialized = serializeLogForMCP(logs[i], i)
             table.insert(output, serialized)
-            count = count + 1
         end
 
         responseData.output = jsone(output)
@@ -1360,18 +1362,6 @@ local function handleMCPCommand(data)
             responseData.output = genScript(logs[idx].Remote, logs[idx].args or {})
         else
             responseData.error = "Log not found"
-            responseData.success = false
-        end
-
-    elseif responseType == "set-config" then
-        -- Set a config value
-        local key = cmd.key
-        local value = cmd.value
-        if key and realconfigs[key] ~= nil then
-            realconfigs[key] = value
-            responseData.output = "Config '" .. key .. "' set to " .. tostring(value)
-        else
-            responseData.error = "Invalid config key"
             responseData.success = false
         end
 
@@ -1469,10 +1459,14 @@ local function sendMCPResponse(data)
     -- Only use HTTP polling if WebSocket is not connected
     if MCPHttpRunning and request then
         pcall(function()
+            local headers = { ["Content-Type"] = "application/json" }
+            if MCPBridgeSecret and MCPBridgeSecret ~= "" then
+                headers["X-Bridge-Secret"] = MCPBridgeSecret
+            end
             request({
                 Url = "http://" .. MCPBridgeURL .. "/respond",
                 Method = "POST",
-                Headers = { ["Content-Type"] = "application/json" },
+                Headers = headers,
                 Body = payload
             })
         end)
@@ -1487,9 +1481,14 @@ local function startHttpPolling()
     spawn(function()
         while MCPHttpRunning and MCPEnabled do
             pcall(function()
+                local headers = nil
+                if MCPBridgeSecret and MCPBridgeSecret ~= "" then
+                    headers = { ["X-Bridge-Secret"] = MCPBridgeSecret }
+                end
                 local response = request({
                     Url = "http://" .. MCPBridgeURL .. "/poll",
-                    Method = "GET"
+                    Method = "GET",
+                    Headers = headers
                 })
 
                 if response and response.StatusCode == 200 and response.Body then
@@ -1544,6 +1543,12 @@ local function connectWebSocket()
     if ws then
         MCPWebSocket = ws
         getgenv()._SimpleSpyMCPWebSocket = ws
+
+        if MCPBridgeSecret and MCPBridgeSecret ~= "" then
+            pcall(function()
+                ws:Send(jsone({ type = "auth", secret = MCPBridgeSecret }))
+            end)
+        end
 
         ws.OnMessage:Connect(function(message)
             local cmd = jsond(message)
